@@ -164,6 +164,7 @@ import java.util.concurrent.atomic.AtomicReference;
         this.properties = initCommandProperties(this.commandKey, propertiesStrategy, commandPropertiesDefaults);
         this.threadPoolKey = initThreadPoolKey(threadPoolKey, this.commandGroup, this.properties.executionIsolationThreadPoolKeyOverride().get());
         this.metrics = initMetrics(metrics, this.commandGroup, this.threadPoolKey, this.commandKey, this.properties);
+        // 初始化 断路器
         this.circuitBreaker = initCircuitBreaker(this.properties.circuitBreakerEnabled().get(), circuitBreaker, this.commandGroup, this.commandKey, this.properties, this.metrics);
         this.threadPool = initThreadPool(threadPool, this.threadPoolKey, threadPoolPropertiesDefaults);
 
@@ -414,6 +415,7 @@ import java.util.concurrent.atomic.AtomicReference;
         final Func0<Observable<R>> applyHystrixSemantics = new Func0<Observable<R>>() {
             @Override
             public Observable<R> call() {
+                // commandState 处于 UNSUBSCRIBED 时，不执行命令
                 if (commandState.get().equals(CommandState.UNSUBSCRIBED)) {
                     return Observable.never();
                 }
@@ -462,6 +464,7 @@ import java.util.concurrent.atomic.AtomicReference;
                     throw new HystrixRuntimeException(FailureType.BAD_REQUEST_EXCEPTION, _cmd.getClass(), getLogMessagePrefix() + " command executed multiple times - this is not permitted.", ex, null);
                 }
 
+                // 命令开始时间戳
                 commandStartTimestamp = System.currentTimeMillis();
 
                 if (properties.requestLogEnabled().get()) {
@@ -471,35 +474,44 @@ import java.util.concurrent.atomic.AtomicReference;
                     }
                 }
 
+                // 缓存开关、缓存KEY
                 final boolean requestCacheEnabled = isRequestCachingEnabled();
                 final String cacheKey = getCacheKey();
 
                 /* try from cache first */
+                // 优先从缓存中获取
                 if (requestCacheEnabled) {
                     HystrixCommandResponseFromCache<R> fromCache = (HystrixCommandResponseFromCache<R>) requestCache.get(cacheKey);
                     if (fromCache != null) {
+                        // 标记 从缓存中结果
                         isResponseFromCache = true;
                         return handleRequestCacheHitAndEmitValues(fromCache, _cmd);
                     }
                 }
 
+                // 获得 执行命令Observable
                 Observable<R> hystrixObservable =
                         Observable.defer(applyHystrixSemantics)
                                 .map(wrapWithAllOnNextHooks);
 
+                // 获得 缓存Observable
                 Observable<R> afterCache;
 
                 // put in cache
                 if (requestCacheEnabled && cacheKey != null) {
                     // wrap it for caching
                     HystrixCachedObservable<R> toCache = HystrixCachedObservable.from(hystrixObservable, _cmd);
+                    // 并发若不存在
                     HystrixCommandResponseFromCache<R> fromCache = (HystrixCommandResponseFromCache<R>) requestCache.putIfAbsent(cacheKey, toCache);
+                    // 添加失败
                     if (fromCache != null) {
                         // another thread beat us so we'll use the cached value instead
                         toCache.unsubscribe();
+                        // 标记 从缓存中结果
                         isResponseFromCache = true;
                         return handleRequestCacheHitAndEmitValues(fromCache, _cmd);
                     } else {
+                        // 添加成功
                         // we just created an ObservableCommand so we cast and return it
                         afterCache = toCache.toObservable();
                     }
@@ -522,7 +534,9 @@ import java.util.concurrent.atomic.AtomicReference;
 
         /* determine if we're allowed to execute */
         if (circuitBreaker.attemptExecution()) {
+            // 获得 信号量
             final TryableSemaphore executionSemaphore = getExecutionSemaphore();
+            // 信号量释放Action
             final AtomicBoolean semaphoreHasBeenReleased = new AtomicBoolean(false);
             final Action0 singleSemaphoreRelease = new Action0() {
                 @Override
@@ -540,10 +554,13 @@ import java.util.concurrent.atomic.AtomicReference;
                 }
             };
 
+            // 信号量 获得
             if (executionSemaphore.tryAcquire()) {
                 try {
+                    // 标记 executionResult 调用开始时间
                     /* used to track userThreadExecutionTime */
                     executionResult = executionResult.setInvocationStartTime(System.currentTimeMillis());
+                    // 获得 执行Observable
                     return executeCommandAndObserve(_cmd)
                             .doOnError(markExceptionThrown)
                             .doOnTerminate(singleSemaphoreRelease)
